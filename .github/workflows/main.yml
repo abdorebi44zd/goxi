@@ -1,0 +1,116 @@
+name: RDP Gateway Setup
+on:
+  workflow_dispatch:
+jobs:
+  rdp-access:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+    steps:
+      - name: Enable RDP Services
+        run: |
+          # Enable RDP connections
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          
+          # Configure firewall
+          netsh advfirewall firewall add rule name="RDPGateway" dir=in action=allow protocol=TCP localport=3389
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          
+          # Restart terminal services
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User
+        run: |
+          $rdpUser = "RDPAdmin"
+          $userPassword = "SecurePass123"  # 14 chars
+          $securePass = ConvertTo-SecureString $userPassword -AsPlainText -Force
+
+          # Create user if doesn't exist
+          if (-not (Get-LocalUser -Name $rdpUser -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name $rdpUser -Password $securePass -AccountNeverExpires
+          }
+
+          # Add to required groups
+          Add-LocalGroupMember -Group "Administrators" -Member $rdpUser
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $rdpUser
+
+          # Correct way to set environment variables
+          echo "RDP_USER=$rdpUser" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$userPassword" >> $env:GITHUB_ENV
+
+      - name: Install Ngrok Tunnel
+        run: |
+          # Download and install Ngrok
+          $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+          $zipPath = "$env:TEMP\ngrok.zip"
+          $ngrokPath = "$env:TEMP\ngrok"
+          
+          Invoke-WebRequest -Uri $ngrokUrl -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $ngrokPath -Force
+          Move-Item "$ngrokPath\ngrok.exe" "C:\Windows\System32\"
+          
+          # Authenticate Ngrok
+          ngrok authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+
+      - name: Start RDP Tunnel
+        run: |
+          # Start Ngrok TCP tunnel for RDP
+          Start-Process -FilePath "ngrok" -ArgumentList "tcp 3389" -WindowStyle Hidden
+          Start-Sleep -Seconds 10
+          
+          # Get tunnel information
+          try {
+              $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 30
+              $publicUrl = $tunnels.tunnels[0].public_url
+              $publicUrl = $publicUrl -replace "tcp://", ""
+              $publicHost, $publicPort = $publicUrl.Split(":")
+              
+              echo "RDP_HOST=$publicHost" >> $env:GITHUB_ENV
+              echo "RDP_PORT=$publicPort" >> $env:GITHUB_ENV
+              
+              Write-Host "RDP Tunnel: $publicHost:$publicPort"
+          } catch {
+              Write-Host "Failed to get Ngrok tunnel info, using Cloudflared fallback"
+          }
+
+      - name: Setup Cloudflared Backup
+        if: env.RDP_HOST == ''
+        run: |
+          # Alternative tunnel using Cloudflared
+          $cloudflaredUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          $cloudflaredPath = "$env:TEMP\cloudflared.exe"
+          
+          Invoke-WebRequest -Uri $cloudflaredUrl -OutFile $cloudflaredPath
+          
+          # Start Cloudflared tunnel in background
+          Start-Process -FilePath $cloudflaredPath -ArgumentList "tunnel --url rdp://localhost:3389" -WindowStyle Hidden
+          Start-Sleep -Seconds 15
+          
+          echo "CLOUDFLARED_ACTIVE=true" >> $env:GITHUB_ENV
+
+      - name: Display Connection Info
+        run: |
+          Write-Host "`n=== RDP CONNECTION INFORMATION ===" -ForegroundColor Green
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          
+          if ($env:RDP_HOST -and $env:RDP_PORT) {
+              Write-Host "Ngrok Tunnel: $env:RDP_HOST:$env:RDP_PORT"
+          } elseif ($env:CLOUDFLARED_ACTIVE) {
+              Write-Host "Tunnel: Cloudflared (check Zero Trust dashboard)"
+          } else {
+              Write-Host "No tunnel active - check previous steps for errors"
+          }
+          Write-Host "=================================`n"
+
+      - name: Maintain RDP Session
+        run: |
+          Write-Host "RDP session is now active and maintained..."
+          
+          # Keep workflow running
+          $cycleCount = 0
+          while ($true) {
+              $cycleCount++
+              Write-Host "[$(Get-Date)] RDP session active - Cycle $cycleCount" -ForegroundColor Blue
+              Start-Sleep -Seconds 300
+          }
