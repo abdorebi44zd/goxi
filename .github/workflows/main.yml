@@ -40,51 +40,124 @@ jobs:
 
       - name: Install Ngrok Tunnel
         run: |
-          # Download and install Ngrok
-          $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
-          $zipPath = "$env:TEMP\ngrok.zip"
-          $ngrokPath = "$env:TEMP\ngrok"
+          Write-Host "Installing Ngrok..."
           
-          Invoke-WebRequest -Uri $ngrokUrl -OutFile $zipPath
-          Expand-Archive -Path $zipPath -DestinationPath $ngrokPath -Force
-          Move-Item "$ngrokPath\ngrok.exe" "C:\Windows\System32\" -Force
+          # Try multiple download sources
+          $downloadUrls = @(
+              "https://github.com/ngrok/ngrok/releases/download/v3.8.0/ngrok-v3.8.0-windows-amd64.zip",
+              "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip",
+              "https://ngrok-agent.s3.amazonaws.com/ngrok.ps1"
+          )
           
-          # Verify ngrok installation
-          ngrok version
-
-      - name: Authenticate Ngrok
-        run: |
-          # Authenticate Ngrok with token
-          $ngrokToken = "${{ secrets.NGROK_AUTH_TOKEN }}"
-          if ([string]::IsNullOrEmpty($ngrokToken)) {
-              Write-Host "Warning: NGROK_AUTH_TOKEN secret is not set"
-              Write-Host "Ngrok will run in unauthenticated mode (limited sessions)"
+          $success = $false
+          
+          foreach ($ngrokUrl in $downloadUrls) {
+              try {
+                  Write-Host "Trying download from: $ngrokUrl"
+                  
+                  if ($ngrokUrl -like "*.ps1") {
+                      # PowerShell installer method
+                      Invoke-RestMethod $ngrokUrl -OutFile ngrok.ps1
+                      .\ngrok.ps1
+                      $success = $true
+                      Write-Host "Ngrok installed via PowerShell script"
+                      break
+                  } else {
+                      # ZIP download method
+                      $zipPath = "$env:TEMP\ngrok.zip"
+                      $ngrokPath = "$env:TEMP\ngrok"
+                      
+                      Invoke-WebRequest -Uri $ngrokUrl -OutFile $zipPath -ErrorAction Stop
+                      
+                      # Create directory and extract
+                      New-Item -ItemType Directory -Path $ngrokPath -Force
+                      Expand-Archive -Path $zipPath -DestinationPath $ngrokPath -Force -ErrorAction Stop
+                      
+                      # Find ngrok.exe in extracted files
+                      $ngrokExe = Get-ChildItem -Path $ngrokPath -Recurse -Filter "ngrok.exe" | Select-Object -First 1
+                      
+                      if ($ngrokExe) {
+                          Copy-Item -Path $ngrokExe.FullName -Destination "C:\Windows\System32\ngrok.exe" -Force
+                          $success = $true
+                          Write-Host "Ngrok installed successfully from ZIP"
+                          break
+                      }
+                  }
+              } catch {
+                  Write-Host "Download failed: $($_.Exception.Message)"
+                  continue
+              }
+          }
+          
+          if (-not $success) {
+              Write-Host "All Ngrok download methods failed, will use Cloudflared only"
+              echo "NGROK_INSTALLED=false" >> $env:GITHUB_ENV
           } else {
-              ngrok authtoken $ngrokToken
-              Write-Host "Ngrok authenticated successfully"
+              echo "NGROK_INSTALLED=true" >> $env:GITHUB_ENV
+              
+              # Verify installation
+              try {
+                  ngrok version
+                  Write-Host "Ngrok verification successful"
+              } catch {
+                  Write-Host "Ngrok verification failed: $($_.Exception.Message)"
+                  echo "NGROK_INSTALLED=false" >> $env:GITHUB_ENV
+              }
           }
 
-      - name: Start RDP Tunnel
+      - name: Authenticate Ngrok
+        if: env.NGROK_INSTALLED == 'true'
         run: |
-          # Start Ngrok TCP tunnel for RDP
+          Write-Host "Authenticating Ngrok..."
+          $ngrokToken = "${{ secrets.NGROK_AUTH_TOKEN }}"
+          
+          if ([string]::IsNullOrEmpty($ngrokToken)) {
+              Write-Host "Warning: NGROK_AUTH_TOKEN secret is not set"
+              Write-Host "Ngrok will run in unauthenticated mode (limited to 2 hours)"
+              echo "NGROK_AUTHENTICATED=false" >> $env:GITHUB_ENV
+          } else {
+              try {
+                  ngrok authtoken $ngrokToken
+                  Write-Host "Ngrok authenticated successfully"
+                  echo "NGROK_AUTHENTICATED=true" >> $env:GITHUB_ENV
+              } catch {
+                  Write-Host "Ngrok authentication failed: $($_.Exception.Message)"
+                  echo "NGROK_AUTHENTICATED=false" >> $env:GITHUB_ENV
+              }
+          }
+
+      - name: Start RDP Tunnel with Ngrok
+        if: env.NGROK_INSTALLED == 'true'
+        run: |
           Write-Host "Starting Ngrok tunnel on port 3389..."
-          Start-Process -FilePath "ngrok" -ArgumentList "tcp", "3389" -WindowStyle Hidden
+          
+          # Start Ngrok TCP tunnel for RDP
+          $ngrokProcess = Start-Process -FilePath "ngrok" -ArgumentList "tcp", "3389" -PassThru -WindowStyle Hidden
+          echo "NGROK_PID=$($ngrokProcess.Id)" >> $env:GITHUB_ENV
+          
           Start-Sleep -Seconds 10
           
           # Get tunnel information with retry logic
-          $maxRetries = 3
+          $maxRetries = 5
           $retryCount = 0
           $tunnelInfo = $null
           
           while ($retryCount -lt $maxRetries -and -not $tunnelInfo) {
               try {
-                  $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 30
-                  $tunnelInfo = $tunnels.tunnels[0]
-                  Write-Host "Tunnel established successfully"
+                  Write-Host "Attempting to get tunnel info (attempt $($retryCount + 1))..."
+                  $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 10
+                  
+                  if ($tunnels.tunnels -and $tunnels.tunnels.Count -gt 0) {
+                      $tunnelInfo = $tunnels.tunnels[0]
+                      Write-Host "Tunnel established successfully: $($tunnelInfo.public_url)"
+                  }
               } catch {
                   $retryCount++
-                  Write-Host "Attempt $retryCount failed, retrying in 5 seconds..."
-                  Start-Sleep -Seconds 5
+                  Write-Host "Attempt $retryCount failed: $($_.Exception.Message)"
+                  if ($retryCount -lt $maxRetries) {
+                      Write-Host "Retrying in 5 seconds..."
+                      Start-Sleep -Seconds 5
+                  }
               }
           }
           
@@ -95,26 +168,38 @@ jobs:
               
               echo "RDP_HOST=$publicHost" >> $env:GITHUB_ENV
               echo "RDP_PORT=$publicPort" >> $env:GITHUB_ENV
+              echo "TUNNEL_TYPE=ngrok" >> $env:GITHUB_ENV
               
               Write-Host "RDP Tunnel: $publicHost:$publicPort"
           } else {
               Write-Host "Failed to get Ngrok tunnel info after $maxRetries attempts"
+              echo "NGROK_TUNNEL_FAILED=true" >> $env:GITHUB_ENV
           }
 
       - name: Setup Cloudflared Backup
-        if: env.RDP_HOST == ''
+        if: env.NGROK_INSTALLED != 'true' || env.NGROK_TUNNEL_FAILED == 'true'
         run: |
-          Write-Host "Setting up Cloudflared as backup tunnel..."
-          # Alternative tunnel using Cloudflared
+          Write-Host "Setting up Cloudflared tunnel..."
+          
+          # Download Cloudflared
           $cloudflaredUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          $cloudflaredPath = "$env:TEMP\cloudflared.exe"
+          $cloudflaredPath = "C:\Windows\System32\cloudflared.exe"
           
-          Invoke-WebRequest -Uri $cloudflaredUrl -OutFile $cloudflaredPath
+          try {
+              Invoke-WebRequest -Uri $cloudflaredUrl -OutFile $cloudflaredPath -ErrorAction Stop
+              Write-Host "Cloudflared downloaded successfully"
+          } catch {
+              Write-Host "Cloudflared download failed: $($_.Exception.Message)"
+              exit 1
+          }
           
-          # Start Cloudflared tunnel in background
-          Start-Process -FilePath $cloudflaredPath -ArgumentList "tunnel", "--url", "rdp://localhost:3389" -WindowStyle Hidden
-          Start-Sleep -Seconds 15
+          # Start Cloudflared tunnel
+          Write-Host "Starting Cloudflared tunnel..."
+          $cloudflaredProcess = Start-Process -FilePath $cloudflaredPath -ArgumentList "tunnel", "--url", "tcp://localhost:3389" -PassThru -WindowStyle Hidden
+          echo "CLOUDFLARED_PID=$($cloudflaredProcess.Id)" >> $env:GITHUB_ENV
+          Start-Sleep -Seconds 10
           
+          echo "TUNNEL_TYPE=cloudflared" >> $env:GITHUB_ENV
           echo "CLOUDFLARED_ACTIVE=true" >> $env:GITHUB_ENV
           Write-Host "Cloudflared tunnel started"
 
@@ -124,117 +209,49 @@ jobs:
           Write-Host "Username: $env:RDP_USER"
           Write-Host "Password: $env:RDP_PASSWORD"
           
-          if ($env:RDP_HOST -and $env:RDP_PORT) {
-              Write-Host "Ngrok Tunnel: $env:RDP_HOST:$env:RDP_PORT"
-              Write-Host "Connection string: mstsc /v:$env:RDP_HOST:$env:RDP_PORT"
-          } elseif ($env:CLOUDFLARED_ACTIVE) {
-              Write-Host "Tunnel: Cloudflared (check Zero Trust dashboard)"
+          if ($env:TUNNEL_TYPE -eq 'ngrok' -and $env:RDP_HOST -and $env:RDP_PORT) {
+              Write-Host "Tunnel Type: Ngrok"
+              Write-Host "Address: $env:RDP_HOST:$env:RDP_PORT"
+              Write-Host "Connection command: mstsc /v:$env:RDP_HOST:$env:RDP_PORT"
+          } elseif ($env:TUNNEL_TYPE -eq 'cloudflared') {
+              Write-Host "Tunnel Type: Cloudflared"
+              Write-Host "Note: Check Cloudflared logs for connection details"
+              Write-Host "Cloudflared is running and forwarding RDP traffic"
           } else {
-              Write-Host "No tunnel active - using direct connection if available"
-              Write-Host "You may need to configure port forwarding manually"
+              Write-Host "Tunnel Status: No active tunnel"
+              Write-Host "RDP is enabled locally on port 3389"
           }
+          
+          Write-Host "`nSession will remain active for 60 minutes"
           Write-Host "=================================`n"
 
       - name: Maintain RDP Session
         run: |
-          Write-Host "RDP session is now active and maintained for 60 minutes..."
+          Write-Host "RDP gateway is now active and maintained..."
           Write-Host "Monitoring tunnel status..."
           
-          # Keep workflow running with status checks
+          # Keep workflow running
           $cycleCount = 0
           while ($cycleCount -lt 72) {  # 72 cycles * 300 seconds = 6 hours
               $cycleCount++
               
-              # Check if ngrok tunnel is still active
-              try {
-                  $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 10 -ErrorAction SilentlyContinue
-                  if ($tunnels.tunnels[0].public_url) {
-                      Write-Host "[$(Get-Date)] RDP session active - Cycle $cycleCount - Tunnel: $($tunnels.tunnels[0].public_url)" -ForegroundColor Green
+              # Check tunnel status based on type
+              if ($env:TUNNEL_TYPE -eq 'ngrok') {
+                  try {
+                      $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 10 -ErrorAction SilentlyContinue
+                      if ($tunnels.tunnels[0].public_url) {
+                          Write-Host "[$(Get-Date)] Ngrok tunnel active - Cycle $cycleCount" -ForegroundColor Green
+                      }
+                  } catch {
+                      Write-Host "[$(Get-Date)] Ngrok tunnel status check failed - Cycle $cycleCount" -ForegroundColor Yellow
                   }
-              } catch {
-                  Write-Host "[$(Get-Date)] RDP session active - Cycle $cycleCount - Tunnel status unknown" -ForegroundColor Yellow
+              } elseif ($env:TUNNEL_TYPE -eq 'cloudflared') {
+                  Write-Host "[$(Get-Date)] Cloudflared tunnel active - Cycle $cycleCount" -ForegroundColor Blue
+              } else {
+                  Write-Host "[$(Get-Date)] RDP service active (no tunnel) - Cycle $cycleCount" -ForegroundColor Cyan
               }
               
               Start-Sleep -Seconds 300
           }
           
-          Write-Host "RDP session timeout reached" -ForegroundColor Red          # Correct way to set environment variables
-          echo "RDP_USER=$rdpUser" >> $env:GITHUB_ENV
-          echo "RDP_PASSWORD=$userPassword" >> $env:GITHUB_ENV
-
-      - name: Install Ngrok Tunnel
-        run: |
-          # Download and install Ngrok
-          $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
-          $zipPath = "$env:TEMP\ngrok.zip"
-          $ngrokPath = "$env:TEMP\ngrok"
-          
-          Invoke-WebRequest -Uri $ngrokUrl -OutFile $zipPath
-          Expand-Archive -Path $zipPath -DestinationPath $ngrokPath -Force
-          Move-Item "$ngrokPath\ngrok.exe" "C:\Windows\System32\"
-          
-          # Authenticate Ngrok
-          ngrok authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
-
-      - name: Start RDP Tunnel
-        run: |
-          # Start Ngrok TCP tunnel for RDP
-          Start-Process -FilePath "ngrok" -ArgumentList "tcp 3389" -WindowStyle Hidden
-          Start-Sleep -Seconds 10
-          
-          # Get tunnel information
-          try {
-              $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 30
-              $publicUrl = $tunnels.tunnels[0].public_url
-              $publicUrl = $publicUrl -replace "tcp://", ""
-              $publicHost, $publicPort = $publicUrl.Split(":")
-              
-              echo "RDP_HOST=$publicHost" >> $env:GITHUB_ENV
-              echo "RDP_PORT=$publicPort" >> $env:GITHUB_ENV
-              
-              Write-Host "RDP Tunnel: $publicHost:$publicPort"
-          } catch {
-              Write-Host "Failed to get Ngrok tunnel info, using Cloudflared fallback"
-          }
-
-      - name: Setup Cloudflared Backup
-        if: env.RDP_HOST == ''
-        run: |
-          # Alternative tunnel using Cloudflared
-          $cloudflaredUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          $cloudflaredPath = "$env:TEMP\cloudflared.exe"
-          
-          Invoke-WebRequest -Uri $cloudflaredUrl -OutFile $cloudflaredPath
-          
-          # Start Cloudflared tunnel in background
-          Start-Process -FilePath $cloudflaredPath -ArgumentList "tunnel --url rdp://localhost:3389" -WindowStyle Hidden
-          Start-Sleep -Seconds 15
-          
-          echo "CLOUDFLARED_ACTIVE=true" >> $env:GITHUB_ENV
-
-      - name: Display Connection Info
-        run: |
-          Write-Host "`n=== RDP CONNECTION INFORMATION ===" -ForegroundColor Green
-          Write-Host "Username: $env:RDP_USER"
-          Write-Host "Password: $env:RDP_PASSWORD"
-          
-          if ($env:RDP_HOST -and $env:RDP_PORT) {
-              Write-Host "Ngrok Tunnel: $env:RDP_HOST:$env:RDP_PORT"
-          } elseif ($env:CLOUDFLARED_ACTIVE) {
-              Write-Host "Tunnel: Cloudflared (check Zero Trust dashboard)"
-          } else {
-              Write-Host "No tunnel active - check previous steps for errors"
-          }
-          Write-Host "=================================`n"
-
-      - name: Maintain RDP Session
-        run: |
-          Write-Host "RDP session is now active and maintained..."
-          
-          # Keep workflow running
-          $cycleCount = 0
-          while ($true) {
-              $cycleCount++
-              Write-Host "[$(Get-Date)] RDP session active - Cycle $cycleCount" -ForegroundColor Blue
-              Start-Sleep -Seconds 300
-          }
+          Write-Host "RDP session timeout reached - shutting down" -ForegroundColor Red
